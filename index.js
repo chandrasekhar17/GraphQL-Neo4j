@@ -1,114 +1,117 @@
+// @ts-nocheck
 const express = require("express");
-const { graphqlHTTP } = require("express-graphql");
-const { buildSchema } = require("graphql");
+const { ApolloServer, gql } = require("apollo-server-express");
 const neo4j = require("neo4j-driver");
-
+const cors = require("cors");
+const jwt = require("jsonwebtoken"); // Add JWT library
 const app = express();
 const PORT = 3009;
+const crypto = require("crypto");
 
-// Connect to Neo4j
+const generateSecretKey = () => {
+  return crypto.randomBytes(16).toString("hex");
+};
+
+const secretKey = generateSecretKey();
+console.log("Generated Secret Key:", secretKey);
+
+// Neo4j connection
+const neo4jUri = "bolt://127.0.0.1:7687";
+const neo4jUser = "neo4j";
+const neo4jPassword = "password";
+
 const driver = neo4j.driver(
-  "bolt://127.0.0.1:7687",
-  neo4j.auth.basic("neo4j", "password")
+  neo4jUri,
+  neo4j.auth.basic(neo4jUser, neo4jPassword)
 );
-const session = driver.session();
+const getDataQuery = (type) => `MATCH (n:${type}) RETURN n`;
+const typeDefs = gql`
+  type Coach {
+    name: String!
+  }
 
-// Define GraphQL schema
-const schema = buildSchema(`
-  type User {
-    id: ID
-    name: String
-    email: String
+  type Team {
+    name: String!
   }
 
   type Query {
-    users: [User]
-    user(id: ID): User
+    getCoaches: [Coach]
+    getTeams: [Team]
+  }
+`;
+
+const SECRET_KEY = secretKey;
+
+// Middleware to verify JWT token
+const authenticateJWT = (req, res, next) => {
+  const token = req.header("Authorization");
+
+  if (!token || !token.startsWith("Bearer")) {
+    return res
+      .status(401)
+      .json({ message: "Unauthorized - No valid token provided" });
   }
 
-  type Mutation {
-    createUser(name: String, email: String): User
-    updateUser(id: ID, name: String, email: String): User
-    deleteUser(id: ID): String
-  }
-`);
+  const tokenValue = token.split(" ")[1].trim(); // Trim to remove whitespaces
 
-// Define GraphQL resolvers
-const root = {
-  users: async () => {
-    const result = await session.run("MATCH (u:User) RETURN u");
-    console.log("return all users");
-    return result.records.map((record) => ({
-      id: record.get("u").identity.low,
-      name: record.get("u").properties.name,
-      email: record.get("u").properties.email,
-    }));
-  },
-  user: async ({ id }) => {
-    const result = await session.run(
-      "MATCH (u:User) WHERE id(u) = $id RETURN u",
-      { id: parseInt(id) }
-    );
-    console.log("return data based on user id");
-    const record = result.records[0];
-    if (record) {
-      return {
-        id: record.get("u").identity.low,
-        name: record.get("u").properties.name,
-        email: record.get("u").properties.email,
-      };
-    }
-    return null;
-  },
-  createUser: async ({ name, email }) => {
-    const result = await session.run(
-      "CREATE (u:User {name: $name, email: $email}) RETURN u",
-      { name, email }
-    );
-    console.log("create user");
-    const record = result.records[0];
-    return {
-      id: record.get("u").identity.low,
-      name: record.get("u").properties.name,
-      email: record.get("u").properties.email,
-    };
-  },
-  updateUser: async ({ id, name, email }) => {
-    const result = await session.run(
-      "MATCH (u:User) WHERE id(u) = $id SET u.name = $name, u.email = $email RETURN u",
-      { id: parseInt(id), name, email }
-    );
-    console.log("update user");
-    const record = result.records[0];
-    if (record) {
-      return {
-        id: record.get("u").identity.low,
-        name: record.get("u").properties.name,
-        email: record.get("u").properties.email,
-      };
-    }
-    return null;
-  },
-  deleteUser: async ({ id }) => {
-    await session.run("MATCH (u:User) WHERE id(u) = $id DETACH DELETE u", {
-      id: parseInt(id),
-    });
-    console.log("delete user ");
-    return `User with ID ${id} deleted successfully`;
+  if (!tokenValue) {
+    return res
+      .status(401)
+      .json({ message: "Unauthorized - No valid token provided" });
+  }
+
+  try {
+    const decoded = jwt.verify(tokenValue, SECRET_KEY);
+    req.user = decoded.user;
+    console.log("Decoded Token:", decoded);
+    next();
+  } catch (error) {
+    console.error("Token verification failed:", error.message);
+    return res.status(401).json({ message: "Unauthorized - Invalid token" });
+  }
+};
+
+// resolver function
+const resolvers = {
+  Query: {
+    getCoaches: async () => {
+      const session = driver.session();
+      const result = await session.run(getDataQuery("COACH"));
+      const coaches = result.records.map((record) => {
+        return {
+          name: record.get("n").properties.name,
+        };
+      });
+      session.close();
+      return coaches;
+    },
+    getTeams: async () => {
+      const session = driver.session();
+      const result = await session.run(getDataQuery("TEAM"));
+      const teams = result.records.map((record) => {
+        return {
+          name: record.get("n").properties.name,
+        };
+      });
+      session.close();
+      return teams;
+    },
   },
 };
 
-// Use the GraphQL middleware
-app.use(
-  "/graphql",
-  graphqlHTTP({
-    schema,
-    rootValue: root,
-    graphiql: true,
-  })
-);
+// create a new apollo server by binding graphQL schema and resolvers
+const server = new ApolloServer({ typeDefs, resolvers });
 
-// Start the server
-app.listen(PORT, () => {
-  console.log(`GraphQL Server is running on http://127.0.0.1:${PORT}/graphql`);
+app.use(cors());
+app.use(authenticateJWT);
+
+async function startServer() {
+  await server.start();
+  server.applyMiddleware({ app, path: "/graphql" });
+}
+
+startServer().then(() => {
+  app.listen(PORT, () => {
+    console.log(`Server is running on http://localhost:${PORT}`);
+  });
 });
